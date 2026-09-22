@@ -1,0 +1,5 @@
+groq
+pydantic
+rapidfuzz
+pytest
+python-dotenv

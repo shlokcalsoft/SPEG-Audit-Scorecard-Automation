@@ -1,0 +1,5 @@
+.env
+__pycache__/
+.pytest_cache/
+data/evidence_results.json
+data/assessments.json
