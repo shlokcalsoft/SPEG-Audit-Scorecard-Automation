@@ -3,3 +3,4 @@ pydantic
 rapidfuzz
 pytest
 python-dotenv
+openpyxl

@@ -14,6 +14,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, ValidationError
 from rapidfuzz.fuzz import ratio
 from dotenv import load_dotenv
+from .provider_router import request_fallback, request_with_fallback
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -30,7 +31,9 @@ MODEL_PREFERENCES = (
     "moonshotai/kimi-k2-instruct",
     "llama-3.1-8b-instant",
 )
-MAX_UNITS = 8
+MAX_UNITS = int(os.getenv("EVIDENCE_MAX_UNITS", "4"))
+MAX_OUTPUT_TOKENS = int(os.getenv("EVIDENCE_MAX_OUTPUT_TOKENS", "600"))
+RESPONSE_RETRIES = int(os.getenv("EVIDENCE_RESPONSE_RETRIES", "2"))
 MIN_CONFIDENCE = 0.6
 SCHEMA_VERSION = 1
 
@@ -209,10 +212,15 @@ def parse_llm_response(response_text: str) -> EvidenceResult:
     if response_text.startswith("```"):
         response_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", response_text, flags=re.IGNORECASE).strip()
     try:
+        parsed = json.loads(response_text)
+        if isinstance(parsed, list):
+            if len(parsed) != 1:
+                raise ValueError("Evidence response must contain exactly one result object")
+            response_text = json.dumps(parsed[0])
         if hasattr(EvidenceResult, "model_validate_json"):
             return EvidenceResult.model_validate_json(response_text)
         return EvidenceResult.parse_raw(response_text)
-    except (ValidationError, json.JSONDecodeError) as exc:
+    except (ValidationError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid evidence response: {exc}") from exc
 
 
@@ -270,26 +278,26 @@ def _as_dict(result: EvidenceResult) -> dict[str, Any]:
     return result.dict()
 
 
-def request_json(client: Any, model: str, messages: list[dict[str, str]]) -> str:
+def request_json(
+    client: Any,
+    model: str,
+    messages: list[dict[str, str]],
+    max_tokens: int = MAX_OUTPUT_TOKENS,
+) -> str:
     """Request JSON, retrying without Groq JSON mode for incompatible models."""
     try:
-        response = client.chat.completions.create(
-            model=model, temperature=0, max_tokens=1200,
-            response_format={"type": "json_object"}, messages=messages,
-        )
-        content = response.choices[0].message.content
-        if content:
-            return content
+        content, _provider = request_with_fallback(client, model, messages, max_tokens)
+        return content
     except Exception as error:
         message = str(error).lower()
         if "json_validate_failed" not in message and "response_format" not in message:
             raise
     response = client.chat.completions.create(
-        model=model, temperature=0, max_tokens=1200, messages=messages,
+        model=model, temperature=0, max_tokens=max_tokens, messages=messages,
     )
     content = response.choices[0].message.content
     if not content:
-        raise ValueError("Groq returned an empty evidence response")
+        return request_fallback(messages, max_tokens)[0]
     return content
 
 
@@ -300,6 +308,9 @@ def extract_evidence(
     output_path: Path = OUTPUT_PATH,
     model: str | None = MODEL,
     limit: int | None = None,
+    max_units: int = MAX_UNITS,
+    start: int = 1,
+    end: int | None = None,
     client: Any | None = None,
 ) -> dict[str, Any]:
     """Extract and validate evidence for every checkpoint."""
@@ -320,22 +331,120 @@ def extract_evidence(
     if not injected_client:
         model = resolve_model(client, model)
     model = model or "injected-test-model"
-    selected = checkpoints[:limit] if limit is not None else checkpoints
+    if limit is not None:
+        selected = checkpoints[:limit]
+    else:
+        selected = checkpoints[start - 1:end]
+    existing_records = []
+    if output_path.exists():
+        existing_records = load_json(output_path).get("evidence", [])
+    existing_by_id = {
+        record["checkpoint_id"]: record
+        for record in existing_records
+        if record.get("checkpoint_id") and not record.get("extraction_error")
+    }
     records = []
-    for checkpoint in selected:
-        retrieval_status, units = get_checkpoint_context(checkpoint["checkpoint_id"], retrieval, unit_index)
+    for position, checkpoint in enumerate(selected, start=start):
+        checkpoint_id = checkpoint["checkpoint_id"]
+        if checkpoint_id in existing_by_id:
+            print(f"[{position}/{len(checkpoints)}] {checkpoint_id}: already complete, skipping", flush=True)
+            continue
+        print(f"[{position}/{len(checkpoints)}] {checkpoint_id}: extracting evidence", flush=True)
+        retrieval_status, units = get_checkpoint_context(
+            checkpoint_id, retrieval, unit_index, max_units=max_units
+        )
         if not units:
             result = EvidenceResult(
                 evidence_status="NO_EVIDENCE", items=[], observation="No retrieved transcript units were available.",
                 confidence=0.0, needs_review=True, review_reason="No retrieved units were available."
             )
         else:
-            content = request_json(
-                client, model,
-                [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": build_prompt(checkpoint, units)}],
-            )
-            result = validate_evidence_quotes(parse_llm_response(content), units)
-        records.append({"checkpoint_id": checkpoint["checkpoint_id"], "retrieval_status": retrieval_status, **_as_dict(result)})
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": build_prompt(checkpoint, units)},
+            ]
+            result = None
+            last_parse_error = None
+            provider_error = None
+            for attempt in range(RESPONSE_RETRIES + 1):
+                if attempt:
+                    print(
+                        f"[{position}/{len(checkpoints)}] {checkpoint_id}: invalid JSON; retry {attempt}/{RESPONSE_RETRIES}",
+                        flush=True,
+                    )
+                    retry_messages = [
+                        {
+                            "role": "system",
+                            "content": SYSTEM_PROMPT + "\nReturn exactly one valid JSON object, no array, markdown, or extra text. Keep observation and reason brief.",
+                        },
+                        messages[1],
+                    ]
+                else:
+                    retry_messages = messages
+                try:
+                    content = request_json(client, model, retry_messages)
+                    result = validate_evidence_quotes(parse_llm_response(content), units)
+                    break
+                except ValueError as error:
+                    last_parse_error = error
+                except Exception as error:
+                    provider_error = error
+                    break
+            if result is None:
+                failure_reason = (
+                    f"Provider request failed: {provider_error}"
+                    if provider_error is not None
+                    else f"Invalid model JSON after {RESPONSE_RETRIES + 1} attempts: {last_parse_error}"
+                )
+                result = EvidenceResult(
+                    evidence_status="AMBIGUOUS",
+                    items=[],
+                    observation="Evidence extraction failed and requires manual review.",
+                    confidence=0.0,
+                    needs_review=True,
+                    review_reason=failure_reason,
+                )
+                record = {
+                    "checkpoint_id": checkpoint_id,
+                    "retrieval_status": retrieval_status,
+                    **_as_dict(result),
+                    "extraction_error": True,
+                }
+                print(f"[{position}/{len(checkpoints)}] {checkpoint_id}: failed; marked for review, continuing", flush=True)
+            else:
+                record = {"checkpoint_id": checkpoint_id, "retrieval_status": retrieval_status, **_as_dict(result)}
+        if not units:
+            record = {"checkpoint_id": checkpoint_id, "retrieval_status": retrieval_status, **_as_dict(result)}
+        records.append(record)
+        existing_by_id[checkpoint_id] = record
+        merged_records = [
+            existing_by_id[item["checkpoint_id"]]
+            for item in checkpoints
+            if item["checkpoint_id"] in existing_by_id
+        ]
+        partial_payload = {
+            "schema_version": SCHEMA_VERSION,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "model": model,
+            "prompt_hash": hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
+            "checkpoint_count": len(merged_records),
+            "evidence": merged_records,
+        }
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(partial_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"[{position}/{len(checkpoints)}] {checkpoint_id}: saved", flush=True)
+    selected_ids = {record["checkpoint_id"] for record in records}
+    merged = {
+        record["checkpoint_id"]: record
+        for record in existing_records
+        if record.get("checkpoint_id") not in selected_ids
+    }
+    merged.update({record["checkpoint_id"]: record for record in records})
+    records = [
+        merged[checkpoint["checkpoint_id"]]
+        for checkpoint in checkpoints
+        if checkpoint["checkpoint_id"] in merged
+    ]
     payload = {
         "schema_version": SCHEMA_VERSION, "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": model, "prompt_hash": hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
@@ -351,8 +460,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--max-units", type=int, default=MAX_UNITS)
+    parser.add_argument("--start", type=int, default=1, help="First checkpoint number, inclusive")
+    parser.add_argument("--end", type=int, help="Last checkpoint number, exclusive")
     args = parser.parse_args()
-    document = extract_evidence(model=args.model, limit=args.limit)
+    document = extract_evidence(
+        model=args.model, limit=args.limit, max_units=args.max_units,
+        start=args.start, end=args.end,
+    )
     print(f"Wrote {document['checkpoint_count']} evidence records to {OUTPUT_PATH}")
 
 

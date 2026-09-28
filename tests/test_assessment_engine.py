@@ -8,6 +8,7 @@ from src.assessment_engine import (
     enforce_rules,
     no_evidence_assessment,
     parse_assessment,
+    rule_based_assessment,
 )
 
 
@@ -91,3 +92,55 @@ def test_assess_writes_records_and_skips_api_for_no_evidence(tmp_path):
 
     assert document["assessments"][0]["response"] == "Not Clarified"
     assert output_path.exists()
+
+
+def test_assess_reads_extractor_items_and_carries_quotes_forward(tmp_path, monkeypatch):
+    import src.assessment_engine as engine
+
+    registry_path = tmp_path / "registry.json"
+    evidence_path = tmp_path / "evidence.json"
+    output_path = tmp_path / "assessments.json"
+    registry_path.write_text(json.dumps({"checkpoints": [{
+        "checkpoint_id": "C001", "phase": "Initiation", "activity": "SOW",
+        "checkpoint_text": "Approved SOW is available",
+    }]}), encoding="utf-8")
+    record = evidence_record("AMBIGUOUS")
+    record["items"] = record.pop("evidence")
+    evidence_path.write_text(json.dumps({"evidence": [record]}), encoding="utf-8")
+    monkeypatch.setenv("OPENROUTER_ONLY", "true")
+    monkeypatch.setattr(engine, "request_json", lambda *args, **kwargs: json.dumps({
+        "response": "Partial", "observation": "Evidence discusses the SOW but does not confirm approval.",
+        "confidence": 0.8, "needs_review": True, "review_reason": "Approval is unclear.",
+        "evidence_status": "AMBIGUOUS", "evidence": [],
+    }))
+
+    document = assess(registry_path, evidence_path, output_path)
+    result = document["assessments"][0]
+
+    assert result["response"] == "Partial"
+    assert result["evidence_status"] == "AMBIGUOUS"
+    assert result["evidence"][0]["unit_id"] == "WIN0001"
+    assert result["needs_review"] is True
+
+
+def test_rule_fallback_suggests_no_from_clear_found_contradiction():
+    record = evidence_record("FOUND")
+    record["items"] = record.pop("evidence")
+    record["items"][0]["stance"] = "contradicts"
+
+    result = rule_based_assessment(record, "Model unavailable")
+
+    assert result.response == "No"
+    assert result.needs_review is True
+    assert result.evidence[0].stance == "contradicts"
+
+
+def test_rule_fallback_uses_partial_for_ambiguous_evidence():
+    record = evidence_record("AMBIGUOUS")
+    record["items"] = record.pop("evidence")
+    record["items"][0]["stance"] = "clarifies"
+
+    result = rule_based_assessment(record)
+
+    assert result.response == "Partial"
+    assert result.needs_review is True

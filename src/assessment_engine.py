@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
+from .provider_router import request_fallback, request_with_fallback
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -28,10 +29,11 @@ MODEL_PREFERENCES = (
     "llama-3.1-8b-instant",
 )
 MIN_CONFIDENCE = 0.6
+MAX_OUTPUT_TOKENS = int(os.getenv("ASSESSMENT_MAX_OUTPUT_TOKENS", "450"))
 SCHEMA_VERSION = 1
 
 EvidenceStatus = Literal["FOUND", "NO_EVIDENCE", "AMBIGUOUS", "CONFLICTING"]
-ResponseValue = Literal["Yes", "Partial", "No", "NA", "Not Clarified"]
+ResponseValue = Literal["Yes", "Partial", "In Progress", "No", "NA", "Not Clarified"]
 Stance = Literal["supports", "contradicts", "clarifies", "supersedes"]
 
 
@@ -61,7 +63,7 @@ class Assessment(BaseModel):
 SYSTEM_PROMPT = """You are a conservative SEPG audit assessment engine.
 Assess only the supplied checkpoint and already-validated evidence.
 Do not add, rewrite, or invent evidence. Do not use outside knowledge.
-The response must be exactly one of: Yes, Partial, No, NA, Not Clarified.
+The response must be exactly one of: Yes, Partial, In Progress, No, NA, Not Clarified.
 NO_EVIDENCE must always have response null or Not Clarified, needs_review true, and confidence below 0.6.
 AMBIGUOUS and CONFLICTING evidence must require review.
 Use Yes only when the evidence clearly establishes the checkpoint.
@@ -70,7 +72,7 @@ Use No only when evidence clearly contradicts the checkpoint; absence of evidenc
 Use NA only when the checkpoint is explicitly not applicable in the supplied evidence.
 
 Return JSON only:
-{"response":"Yes|Partial|No|NA|Not Clarified|null","observation":"...","confidence":0.0,"needs_review":true,"review_reason":"... or null"}"""
+{"response":"Yes|Partial|In Progress|No|NA|Not Clarified|null","observation":"...","confidence":0.0,"needs_review":true,"review_reason":"... or null"}"""
 
 
 def load_json(path: Path) -> Any:
@@ -129,7 +131,7 @@ def prompt_hash() -> str:
 
 def build_prompt(checkpoint: dict[str, Any], evidence_record: dict[str, Any]) -> str:
     """Build an assessment prompt from validated evidence only."""
-    evidence = evidence_record.get("evidence", [])
+    evidence = evidence_record.get("evidence") or evidence_record.get("items", [])
     evidence_text = "\n\n".join(
         f"UNIT: {item['unit_id']} | SEGMENTS: {', '.join(item.get('segment_ids', []))}\n"
         f"STANCE: {item['stance']}\nQUOTE: {item['verbatim_quote']}\n"
@@ -155,31 +157,60 @@ def no_evidence_assessment(evidence_record: dict[str, Any]) -> Assessment:
         confidence=0.0,
         needs_review=True,
         review_reason=reason,
-        evidence_status="NO_EVIDENCE",
+        evidence_status=(
+            evidence_record.get("evidence_status", "NO_EVIDENCE")
+            if evidence_record.get("extraction_error")
+            else "NO_EVIDENCE"
+        ),
         evidence=[],
     )
+
+
+def rule_based_assessment(evidence_record: dict[str, Any], reason: str | None = None) -> Assessment:
+    """Create a conservative, review-required draft from validated evidence stances."""
+    items = evidence_items(evidence_record)
+    stances = {item.get("stance") for item in items}
+    status = evidence_record.get("evidence_status", "AMBIGUOUS")
+    if not items or status == "NO_EVIDENCE":
+        return no_evidence_assessment(evidence_record)
+    if status == "FOUND" and stances == {"supports"}:
+        response: ResponseValue = "Yes"
+    elif status == "FOUND" and stances == {"contradicts"}:
+        response = "No"
+    else:
+        response = "Partial"
+    detail = reason or "OpenRouter assessment was unavailable; response was drafted from validated evidence stances."
+    return Assessment(
+        response=response,
+        observation=evidence_record.get("observation") or "Validated transcript evidence requires reviewer confirmation.",
+        confidence=min(float(evidence_record.get("confidence", 0.0)), 0.59),
+        needs_review=True,
+        review_reason=detail,
+        evidence_status=status,
+        evidence=[AssessmentEvidence(**item) for item in items],
+    )
+
+
+def evidence_items(evidence_record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read validated quote items from either pipeline artifact contract."""
+    return evidence_record.get("evidence") or evidence_record.get("items", [])
 
 
 def request_json(client: Any, model: str, messages: list[dict[str, str]]) -> str:
     """Request JSON, retrying without Groq JSON mode for incompatible models."""
     try:
-        response = client.chat.completions.create(
-            model=model, temperature=0, max_tokens=700,
-            response_format={"type": "json_object"}, messages=messages,
-        )
-        content = response.choices[0].message.content
-        if content:
-            return content
+        content, _provider = request_with_fallback(client, model, messages, MAX_OUTPUT_TOKENS)
+        return content
     except Exception as error:
         message = str(error).lower()
         if "json_validate_failed" not in message and "response_format" not in message:
             raise
     response = client.chat.completions.create(
-        model=model, temperature=0, max_tokens=700, messages=messages,
+        model=model, temperature=0, max_tokens=MAX_OUTPUT_TOKENS, messages=messages,
     )
     content = response.choices[0].message.content
     if not content:
-        raise ValueError("Groq returned an empty assessment response")
+        return request_fallback(messages, MAX_OUTPUT_TOKENS)[0]
     return content
 
 
@@ -198,12 +229,13 @@ def assess_response(client: Any, checkpoint: dict[str, Any], evidence_record: di
 def enforce_rules(assessment: Assessment, evidence_record: dict[str, Any]) -> Assessment:
     """Apply non-negotiable assessment rules after model output."""
     evidence_status = evidence_record.get("evidence_status", "NO_EVIDENCE")
-    if evidence_status == "NO_EVIDENCE" or not evidence_record.get("evidence"):
+    items = evidence_items(evidence_record)
+    if evidence_status == "NO_EVIDENCE" or not items:
         return no_evidence_assessment(evidence_record)
 
     assessment.evidence_status = evidence_status
     assessment.evidence = [
-        AssessmentEvidence(**item) for item in evidence_record.get("evidence", [])
+        AssessmentEvidence(**item) for item in items
     ]
     if evidence_status in {"AMBIGUOUS", "CONFLICTING"}:
         assessment.needs_review = True
@@ -226,6 +258,9 @@ def assess(
     output_path: Path = OUTPUT_PATH,
     model: str | None = MODEL,
     limit: int | None = None,
+    start: int = 1,
+    end: int | None = None,
+    local_only: bool = False,
     client: Any | None = None,
 ) -> dict[str, Any]:
     """Assess every checkpoint from evidence results and write assessments JSON."""
@@ -235,41 +270,89 @@ def assess(
     evidence_by_id = {
         item["checkpoint_id"]: item for item in evidence_document.get("evidence", [])
     }
-    selected = checkpoints[:limit] if limit is not None else checkpoints
+    if limit is not None:
+        selected = checkpoints[:limit]
+    else:
+        selected = checkpoints[start - 1:end]
     injected_client = client is not None
     needs_client = any(
-        evidence_by_id.get(checkpoint["checkpoint_id"], {}).get("evidence")
+        evidence_items(evidence_by_id.get(checkpoint["checkpoint_id"], {}))
         and evidence_by_id.get(checkpoint["checkpoint_id"], {}).get("evidence_status") != "NO_EVIDENCE"
         for checkpoint in selected
     )
-    if client is None and needs_client:
-        if not os.environ.get("GROQ_API_KEY"):
+    if client is None and needs_client and not local_only:
+        openrouter_only = os.getenv("OPENROUTER_ONLY", "false").lower() == "true"
+        if not openrouter_only and not os.environ.get("GROQ_API_KEY"):
             raise RuntimeError("GROQ_API_KEY is required to assess evidence-bearing checkpoints")
-        try:
-            from groq import Groq
-        except ImportError as exc:
-            raise RuntimeError("Install Groq with: py -m pip install groq") from exc
-        client = Groq(api_key=os.environ["GROQ_API_KEY"])
-        model = resolve_model(client, model)
+        if openrouter_only:
+            client = object()
+            model = model or "openrouter"
+        else:
+            try:
+                from groq import Groq
+            except ImportError as exc:
+                raise RuntimeError("Install Groq with: py -m pip install groq") from exc
+            client = Groq(api_key=os.environ["GROQ_API_KEY"])
+            model = resolve_model(client, model)
     elif injected_client:
         model = model or "injected-test-model"
+    elif local_only:
+        model = "local-rules"
 
-    records = []
+    existing_records = load_json(output_path).get("assessments", []) if output_path.exists() else []
+    existing_by_id = {
+        record["checkpoint_id"]: record
+        for record in existing_records
+        if record.get("checkpoint_id")
+    }
     for checkpoint in selected:
         evidence_record = evidence_by_id.get(
             checkpoint["checkpoint_id"],
             {"evidence_status": "NO_EVIDENCE", "evidence": [], "review_reason": "No evidence record exists."},
         )
-        if not evidence_record.get("evidence") or evidence_record.get("evidence_status") == "NO_EVIDENCE":
+        if not evidence_items(evidence_record) or evidence_record.get("evidence_status") == "NO_EVIDENCE":
             assessment = no_evidence_assessment(evidence_record)
+            assessment_method = "no-evidence-rule"
+        elif local_only:
+            assessment = rule_based_assessment(evidence_record)
+            assessment_method = "local-evidence-rule"
         else:
-            if client is None:
-                raise RuntimeError("An assessment client is required for evidence-bearing checkpoints")
-            assessment = enforce_rules(
-                assess_response(client, checkpoint, evidence_record, model), evidence_record
-            )
-        records.append({"checkpoint_id": checkpoint["checkpoint_id"], **_dump(assessment)})
-
+            try:
+                if client is None:
+                    raise RuntimeError("No assessment client is configured")
+                assessment = enforce_rules(
+                    assess_response(client, checkpoint, evidence_record, model), evidence_record
+                )
+                assessment_method = "model"
+            except Exception as error:
+                assessment = rule_based_assessment(evidence_record, f"Model assessment failed: {error}")
+                assessment_method = "local-evidence-rule-fallback"
+        existing_by_id[checkpoint["checkpoint_id"]] = {
+            "checkpoint_id": checkpoint["checkpoint_id"],
+            **_dump(assessment),
+            "assessment_method": assessment_method,
+        }
+        partial_records = [
+            existing_by_id[item["checkpoint_id"]]
+            for item in checkpoints
+            if item["checkpoint_id"] in existing_by_id
+        ]
+        partial_payload = {
+            "schema_version": SCHEMA_VERSION,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "model": model,
+            "prompt_hash": prompt_hash(),
+            "checkpoint_count": len(partial_records),
+            "assessments": partial_records,
+        }
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(partial_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    merged = existing_by_id
+    records = [
+        merged[checkpoint["checkpoint_id"]]
+        for checkpoint in checkpoints
+        if checkpoint["checkpoint_id"] in merged
+    ]
     payload = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -288,8 +371,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--start", type=int, default=1, help="First checkpoint number, inclusive")
+    parser.add_argument("--end", type=int, help="Last checkpoint number, exclusive")
+    parser.add_argument("--local-only", action="store_true", help="Use deterministic evidence rules without calling a model")
     args = parser.parse_args()
-    document = assess(model=args.model, limit=args.limit)
+    document = assess(model=args.model, limit=args.limit, start=args.start, end=args.end, local_only=args.local_only)
     print(f"Wrote {document['checkpoint_count']} assessments to {OUTPUT_PATH}")
 
 

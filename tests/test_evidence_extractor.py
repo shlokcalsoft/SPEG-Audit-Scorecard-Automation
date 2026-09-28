@@ -96,7 +96,14 @@ def test_no_evidence_is_preserved_without_response_fields():
     assert result.items == []
 
 
-def test_extract_evidence_writes_contract_with_mock_client(tmp_path):
+def test_single_result_array_is_unwrapped():
+    result = valid_result()
+
+    assert parse_llm_response(json.dumps([result.model_dump()])).evidence_status == "FOUND"
+
+
+def test_extract_evidence_writes_contract_with_mock_client(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_ONLY", "false")
     retrieval, transcript = source_data()
     registry = {"checkpoints": [{
         "checkpoint_id": "C001", "phase": "Initiation", "activity": "SOW",
@@ -135,3 +142,86 @@ def test_extract_evidence_writes_contract_with_mock_client(tmp_path):
     assert document["checkpoint_count"] == 1
     assert document["evidence"][0]["items"][0]["unit_id"] == "WIN0001"
     assert output_path.exists()
+
+
+def test_invalid_response_is_saved_and_next_checkpoint_continues(tmp_path, monkeypatch):
+    from src import evidence_extractor
+
+    retrieval, transcript = source_data()
+    retrieval["by_checkpoint"].append({
+        "checkpoint_id": "C002", "retrieval_status": "tagged",
+        "tagged_units": [{"unit_id": "WIN0001"}], "fallback_units": [],
+    })
+    registry = {"checkpoints": [
+        {"checkpoint_id": "C001", "checkpoint_text": "First requirement"},
+        {"checkpoint_id": "C002", "checkpoint_text": "Second requirement"},
+    ]}
+    registry_path = tmp_path / "registry.json"
+    retrieval_path = tmp_path / "retrieval.json"
+    transcript_path = tmp_path / "transcript.json"
+    output_path = tmp_path / "evidence.json"
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    retrieval_path.write_text(json.dumps(retrieval), encoding="utf-8")
+    transcript_path.write_text(json.dumps(transcript), encoding="utf-8")
+
+    valid_json = json.dumps({
+        "evidence_status": "FOUND", "items": [], "observation": "Review source.",
+        "confidence": 0.9, "needs_review": False, "review_reason": None,
+    })
+    responses = iter(["{bad", "{still bad", valid_json])
+    monkeypatch.setattr(evidence_extractor, "RESPONSE_RETRIES", 1)
+    monkeypatch.setattr(evidence_extractor, "request_json", lambda *args, **kwargs: next(responses))
+
+    document = extract_evidence(
+        registry_path, retrieval_path, transcript_path, output_path,
+        client=object(),
+    )
+
+    by_id = {item["checkpoint_id"]: item for item in document["evidence"]}
+    assert by_id["C001"]["extraction_error"] is True
+    assert by_id["C001"]["needs_review"] is True
+    assert "extraction_error" not in by_id["C002"]
+
+
+def test_provider_failure_is_saved_and_next_checkpoint_continues(tmp_path, monkeypatch):
+    from src import evidence_extractor
+
+    retrieval, transcript = source_data()
+    retrieval["by_checkpoint"].append({
+        "checkpoint_id": "C002", "retrieval_status": "tagged",
+        "tagged_units": [{"unit_id": "WIN0001"}], "fallback_units": [],
+    })
+    registry = {"checkpoints": [
+        {"checkpoint_id": "C001", "checkpoint_text": "First requirement"},
+        {"checkpoint_id": "C002", "checkpoint_text": "Second requirement"},
+    ]}
+    registry_path = tmp_path / "registry.json"
+    retrieval_path = tmp_path / "retrieval.json"
+    transcript_path = tmp_path / "transcript.json"
+    output_path = tmp_path / "evidence.json"
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    retrieval_path.write_text(json.dumps(retrieval), encoding="utf-8")
+    transcript_path.write_text(json.dumps(transcript), encoding="utf-8")
+
+    successful_response = json.dumps({
+        "evidence_status": "NO_EVIDENCE", "items": [], "observation": "No evidence found.",
+        "confidence": 0.0, "needs_review": True, "review_reason": "No matching quote.",
+    })
+    responses = iter([RuntimeError("all OpenRouter models failed"), successful_response])
+
+    def request_mock(*args, **kwargs):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(evidence_extractor, "request_json", request_mock)
+    document = extract_evidence(
+        registry_path, retrieval_path, transcript_path, output_path,
+        client=object(),
+    )
+
+    by_id = {item["checkpoint_id"]: item for item in document["evidence"]}
+    assert by_id["C001"]["extraction_error"] is True
+    assert "all OpenRouter models failed" in by_id["C001"]["review_reason"]
+    assert "extraction_error" not in by_id["C002"]
